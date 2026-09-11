@@ -1,118 +1,114 @@
 import path from "path"
-import { pathToFileURL } from "url"
-import z from "zod"
-import { Effect } from "effect"
-import * as Stream from "effect/Stream"
-import { EffectLogger } from "@/effect"
-import { Ripgrep } from "../file/ripgrep"
+import { Effect, Schema } from "effect"
+import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Skill } from "../skill"
 import * as Tool from "./tool"
+import DESCRIPTION from "./skill.txt"
+// kilocode_change start - gate + run shell injection in skill bodies
+import { Config } from "@/config/config"
+import { Shell } from "@opencode-ai/core/shell"
+import { InstanceState } from "@/effect/instance-state"
+import { RuntimeFlags } from "@/effect/runtime-flags"
+import { ShellPermission } from "./shell"
+import { SkillInject } from "@/kilocode/skills/inject"
+// kilocode_change end
 
-const Parameters = z.object({
-  name: z.string().describe("The name of the skill from available_skills"),
+export const Parameters = Schema.Struct({
+  name: Schema.String.annotate({ description: "The name of the skill from available_skills" }),
 })
 
 export const SkillTool = Tool.define(
   "skill",
   Effect.gen(function* () {
     const skill = yield* Skill.Service
-    const rg = yield* Ripgrep.Service
+    const ripgrep = yield* Ripgrep.Service
+    const flags = yield* RuntimeFlags.Service // kilocode_change
+    const permission = yield* ShellPermission // kilocode_change - decompose skill commands like the bash tool
+    const config = yield* Config.Service // kilocode_change - resolve a parseable shell for injection
 
-    return () =>
-      Effect.gen(function* () {
-        const list = yield* skill.available().pipe(Effect.provide(EffectLogger.layer))
+    return {
+      description: DESCRIPTION,
+      parameters: Parameters,
+      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const info = yield* skill
+            .require(params.name)
+            .pipe(Effect.catchTag("Skill.NotFoundError", (error) => Effect.die(new Error(error.message))))
 
-        const description =
-          list.length === 0
-            ? "Load a specialized skill that provides domain-specific instructions and workflows. No skills are currently available."
-            : [
-                "Load a specialized skill that provides domain-specific instructions and workflows.",
+          yield* ctx.ask({
+            permission: "skill",
+            patterns: [params.name],
+            always: [params.name],
+            metadata: {},
+          })
+
+          // kilocode_change start - render `!`cmd`` shell injection, gated by trust + kill-switch + batch approval
+          const cfg = yield* config.get()
+          const content = yield* SkillInject.render({
+            content: info.content,
+            trusted: info.trusted === true,
+            disabled: flags.disableSkillShell,
+            cwd: yield* InstanceState.directory,
+            skill: info.name,
+            shell: Shell.acceptable(cfg.shell),
+            ctx,
+            decompose: permission.decompose,
+          })
+          // kilocode_change end
+
+          // kilocode_change start - built-in skills have no filesystem directory
+          if (info.location === Skill.BUILTIN_LOCATION) {
+            return {
+              title: `Loaded skill: ${info.name}`,
+              output: [
+                `<skill_content name="${info.name}">`,
+                `# Skill: ${info.name}`,
                 "",
-                "When you recognize that a task matches one of the available skills listed below, use this tool to load the full skill instructions.",
-                "",
-                "The skill will inject detailed instructions, workflows, and access to bundled resources (scripts, references, templates) into the conversation context.",
-                "",
-                'Tool output includes a `<skill_content name="...">` block with the loaded content.',
-                "",
-                "The following skills provide specialized sets of instructions for particular tasks",
-                "Invoke this tool to load a skill when a task matches one of the available skills listed below:",
-                "",
-                Skill.fmt(list, { verbose: false }),
-              ].join("\n")
+                content.trim(), // kilocode_change
+                "</skill_content>",
+              ].join("\n"),
+              metadata: {
+                name: info.name,
+                dir: Skill.BUILTIN_LOCATION,
+              },
+            }
+          }
+          // kilocode_change end
 
-        return {
-          description,
-          parameters: Parameters,
-          execute: (params: z.infer<typeof Parameters>, ctx: Tool.Context) =>
-            Effect.gen(function* () {
-              const info = yield* skill.get(params.name)
-              if (!info) {
-                const all = yield* skill.all()
-                const available = all.map((item) => item.name).join(", ")
-                throw new Error(`Skill "${params.name}" not found. Available skills: ${available || "none"}`)
-              }
+          const dir = path.dirname(info.location)
+          const base = dir
+          const files = yield* ripgrep.find({
+            cwd: dir,
+            pattern: "!**/SKILL.md",
+            hidden: true,
+            follow: false,
+            signal: ctx.abort,
+            limit: 10,
+          })
 
-              yield* ctx.ask({
-                permission: "skill",
-                patterns: [params.name],
-                always: [params.name],
-                metadata: {},
-              })
-
-              // kilocode_change start - built-in skills have no filesystem directory
-              if (info.location === Skill.BUILTIN_LOCATION) {
-                return {
-                  title: `Loaded skill: ${info.name}`,
-                  output: [
-                    `<skill_content name="${info.name}">`,
-                    `# Skill: ${info.name}`,
-                    "",
-                    info.content.trim(),
-                    "</skill_content>",
-                  ].join("\n"),
-                  metadata: {
-                    name: info.name,
-                    dir: Skill.BUILTIN_LOCATION,
-                  },
-                }
-              }
-              // kilocode_change end
-
-              const dir = path.dirname(info.location)
-              const base = pathToFileURL(dir).href
-              const limit = 10
-              const files = yield* rg.files({ cwd: dir, follow: false, hidden: true, signal: ctx.abort }).pipe(
-                Stream.filter((file) => !file.includes("SKILL.md")),
-                Stream.map((file) => path.resolve(dir, file)),
-                Stream.take(limit),
-                Stream.runCollect,
-                Effect.map((chunk) => [...chunk].map((file) => `<file>${file}</file>`).join("\n")),
-              )
-
-              return {
-                title: `Loaded skill: ${info.name}`,
-                output: [
-                  `<skill_content name="${info.name}">`,
-                  `# Skill: ${info.name}`,
-                  "",
-                  info.content.trim(),
-                  "",
-                  `Base directory for this skill: ${base}`,
-                  "Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.",
-                  "Note: file list is sampled.",
-                  "",
-                  "<skill_files>",
-                  files,
-                  "</skill_files>",
-                  "</skill_content>",
-                ].join("\n"),
-                metadata: {
-                  name: info.name,
-                  dir,
-                },
-              }
-            }).pipe(Effect.orDie),
-        }
-      })
+          return {
+            title: `Loaded skill: ${info.name}`,
+            output: [
+              `<skill_content name="${info.name}">`,
+              `# Skill: ${info.name}`,
+              "",
+              content.trim(), // kilocode_change
+              "",
+              `Base directory for this skill: ${base}`,
+              "Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.",
+              "Note: file list is sampled.",
+              "",
+              "<skill_files>",
+              files.map((file) => `<file>${path.resolve(dir, file.path)}</file>`).join("\n"),
+              "</skill_files>",
+              "</skill_content>",
+            ].join("\n"),
+            metadata: {
+              name: info.name,
+              dir,
+            },
+          }
+        }).pipe(Effect.orDie),
+    }
   }),
 )
